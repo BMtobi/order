@@ -21,6 +21,9 @@
   <!-- 載入 html2canvas 截圖套件 -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 
+  <!-- 載入 localforage 用於處理本機大容量快取 (IndexedDB) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/localforage/1.10.0/localforage.min.js"></script>
+
   <style>
     @keyframes shake {
       0%, 100% { transform: translateX(0); }
@@ -36,11 +39,12 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useState, useMemo, useRef, useCallback } = React;
+    const { useState, useEffect, useMemo, useRef, useCallback } = React;
 
     function App() {
       const [historyData, setHistoryData] = useState([]);
       const [isProcessing, setIsProcessing] = useState(false);
+      const [isRestoringCache, setIsRestoringCache] = useState(true); // 追蹤快取讀取狀態
       const [error, setError] = useState('');
       const [copySuccess, setCopySuccess] = useState(false);
       const [isDownloadingImage, setIsDownloadingImage] = useState(false);
@@ -48,7 +52,7 @@
       
       // 篩選設定
       const [filters, setFilters] = useState({
-        mediaMode: 'video', // 'video' | 'music'
+        mediaMode: 'video', 
         onlyVTuber: false,
         onlyYTMData: false, 
         targetYear: 'all',
@@ -62,6 +66,49 @@
       const [isFetchingHolodex, setIsFetchingHolodex] = useState(false);
       const [hasFetchedHolodex, setHasFetchedHolodex] = useState(false); 
       const [vtuberShake, setVtuberShake] = useState(false); 
+
+      // === 頁面載入時讀取本機快取 ===
+      useEffect(() => {
+        async function loadCache() {
+          try {
+            const cachedHistory = await localforage.getItem('yt_historyData');
+            if (cachedHistory) setHistoryData(cachedHistory);
+            
+            const cachedAvatars = await localforage.getItem('yt_channelAvatars');
+            if (cachedAvatars) {
+              setChannelAvatars(cachedAvatars);
+              if (Object.keys(cachedAvatars).length > 0) setHasFetchedHolodex(true);
+            }
+            
+            const cachedApiKey = await localforage.getItem('yt_holodexApiKey');
+            if (cachedApiKey) setHolodexApiKey(cachedApiKey);
+
+          } catch (e) {
+            console.error('讀取快取失敗:', e);
+          } finally {
+            setIsRestoringCache(false);
+          }
+        }
+        loadCache();
+      }, []);
+
+      // 清除快取功能
+      const handleClearCache = async () => {
+        if (!window.confirm('確定要清除本機的觀看紀錄與頭像快取嗎？\n這將需要您重新上傳檔案。')) return;
+        setIsProcessing(true);
+        try {
+          await localforage.clear();
+          setHistoryData([]);
+          setChannelAvatars({});
+          setHolodexApiKey('');
+          setHasFetchedHolodex(false);
+          setFilters(prev => ({ ...prev, onlyVTuber: false }));
+        } catch (e) {
+          console.error('清除快取失敗:', e);
+        } finally {
+          setIsProcessing(false);
+        }
+      };
 
       // 取得可用的年份
       const availableYears = useMemo(() => {
@@ -100,7 +147,7 @@
         setCopySuccess(false);
 
         const reader = new FileReader();
-        reader.onload = (e) => {
+        reader.onload = async (e) => {
           try {
             const json = JSON.parse(e.target.result);
             if (!Array.isArray(json)) throw new Error("檔案格式不符：必須是陣列格式");
@@ -112,6 +159,9 @@
             if (!isYouTubeHistory) throw new Error("找不到 YouTube 紀錄，請確認這是 Google Takeout 的檔案");
 
             setHistoryData(json);
+            // 上傳成功後將資料寫入快取
+            await localforage.setItem('yt_historyData', json);
+
           } catch (err) {
             setError(`解析失敗：${err.message}`);
           } finally {
@@ -157,6 +207,10 @@
           }
           setChannelAvatars(updates);
           setHasFetchedHolodex(true); 
+          
+          // 成功獲取後寫入快取
+          await localforage.setItem('yt_channelAvatars', updates);
+          await localforage.setItem('yt_holodexApiKey', holodexApiKey);
         } finally {
           setIsFetchingHolodex(false);
         }
@@ -246,7 +300,6 @@
         setIsDownloadingImage(true);
         
         try {
-          // 強制等待圖片載入
           const images = Array.from(summaryCardRef.current.querySelectorAll('img'));
           await Promise.all(images.map(img => {
             if (img.complete) return Promise.resolve();
@@ -463,7 +516,7 @@
       }, [historyData, filters, channelAvatars]);
 
       return (
-        <div className="max-w-6xl mx-auto space-y-12">
+        <div className="max-w-6xl mx-auto space-y-12 p-4 sm:p-8">
           
           {/* === 控制面板區塊 === */}
           <div className="bg-[#1a1a1a] rounded-xl p-6 border border-gray-800 shadow-2xl">
@@ -479,14 +532,33 @@
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+              
+              {/* === 上傳/快取區塊 === */}
               <div className="space-y-6">
-                <div className="flex flex-col justify-center items-center border border-dashed border-gray-700 rounded-lg p-6 hover:border-yellow-500 transition-colors bg-[#141414]">
-                  <i className="fa-solid fa-file-code text-3xl text-gray-500 mb-3"></i>
-                  <label className="cursor-pointer bg-yellow-600 hover:bg-yellow-700 active:bg-yellow-800 text-black px-6 py-2 rounded-md font-bold transition-colors text-sm touch-manipulation">
-                    選擇 watch-history.json
-                    <input type="file" accept=".json" className="hidden" onChange={handleFileUpload} disabled={isProcessing} />
-                  </label>
-                </div>
+                {isRestoringCache ? (
+                  <div className="flex flex-col justify-center items-center border border-gray-800 rounded-lg p-6 h-32 bg-[#141414]">
+                    <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-yellow-500 mb-3"></div>
+                    <p className="text-gray-400 text-sm">正在讀取本機快取...</p>
+                  </div>
+                ) : historyData.length === 0 ? (
+                  <div className="flex flex-col justify-center items-center border border-dashed border-gray-700 rounded-lg p-6 h-32 hover:border-yellow-500 transition-colors bg-[#141414]">
+                    <i className="fa-solid fa-file-code text-3xl text-gray-500 mb-3"></i>
+                    <label className="cursor-pointer bg-yellow-600 hover:bg-yellow-700 active:bg-yellow-800 text-black px-6 py-2 rounded-md font-bold transition-colors text-sm touch-manipulation">
+                      選擇 watch-history.json
+                      <input type="file" accept=".json" className="hidden" onChange={handleFileUpload} disabled={isProcessing} />
+                    </label>
+                  </div>
+                ) : (
+                  <div className="flex flex-col justify-center items-center border border-green-800/50 rounded-lg p-6 h-32 bg-[#141414]/80">
+                    <div className="flex items-center text-green-400 mb-2">
+                      <i className="fa-solid fa-database text-2xl mr-2"></i>
+                      <span className="font-bold text-lg">已載入 {historyData.length.toLocaleString()} 筆紀錄</span>
+                    </div>
+                    <button onClick={handleClearCache} className="text-sm text-gray-500 hover:text-red-400 underline mt-2 transition-colors">
+                      清除快取並重新上傳
+                    </button>
+                  </div>
+                )}
 
                 {historyData.length > 0 && (
                   <div className="bg-[#141414] border border-gray-800 rounded-lg p-4 space-y-4">
@@ -518,6 +590,7 @@
                 )}
               </div>
 
+              {/* === 篩選條件區塊 === */}
               <div className="space-y-4">
                 <div className="flex items-center justify-between border-b border-gray-800 pb-3 mb-4">
                   <div className="flex items-center space-x-2 text-lg font-bold text-gray-200">
@@ -642,7 +715,7 @@
           {isProcessing && (
             <div className="text-center py-20">
               <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-yellow-500 mx-auto"></div>
-              <p className="mt-4 text-sm text-gray-500 tracking-widest">正在生成分析報告...</p>
+              <p className="mt-4 text-sm text-gray-500 tracking-widest">正在處理資料中...</p>
             </div>
           )}
 
