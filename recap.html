@@ -1,0 +1,916 @@
+import React, { useState, useMemo, useRef, useCallback } from 'react';
+import { Upload, Filter, Youtube, Video, UserCircle, AlertCircle, PlayCircle, FileJson, Key, Zap, Library, Film, Share2, CheckCircle2, Download, Image as ImageIcon, Music } from 'lucide-react';
+
+export default function App() {
+  const [historyData, setHistoryData] = useState([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [error, setError] = useState('');
+  const [copySuccess, setCopySuccess] = useState(false);
+  const [isDownloadingImage, setIsDownloadingImage] = useState(false);
+  const summaryCardRef = useRef(null);
+  
+  // 篩選設定
+  const [filters, setFilters] = useState({
+    mediaMode: 'video', // 'video' | 'music'
+    onlyVTuber: false,
+    onlyYTMData: false, 
+    targetYear: 'all',
+    targetSeason: 'all',
+    topN: 10
+  });
+
+  // Holodex 頭像與狀態追蹤
+  const [holodexApiKey, setHolodexApiKey] = useState('');
+  const [channelAvatars, setChannelAvatars] = useState({});
+  const [isFetchingHolodex, setIsFetchingHolodex] = useState(false);
+  const [hasFetchedHolodex, setHasFetchedHolodex] = useState(false); // 追蹤是否成功載入過
+  const [vtuberShake, setVtuberShake] = useState(false); // 觸發震動動畫
+
+  // 取得可用的年份
+  const availableYears = useMemo(() => {
+    if (historyData.length === 0) return [];
+    const years = new Set(historyData.map(item => {
+      if (!item.time) return null;
+      const date = new Date(item.time);
+      return isNaN(date.getFullYear()) ? null : date.getFullYear();
+    }).filter(Boolean));
+    return Array.from(years).sort((a, b) => b - a);
+  }, [historyData]);
+
+  // 季度定義
+  const seasons = [
+    { value: 'spring', label: '春季 (3-5月)', display: '3-5月', months: [2, 3, 4] },
+    { value: 'summer', label: '夏季 (6-8月)', display: '6-8月', months: [5, 6, 7] },
+    { value: 'autumn', label: '秋季 (9-11月)', display: '9-11月', months: [8, 9, 10] },
+    { value: 'winter', label: '冬季 (12-2月)', display: '12-2月', months: [11, 0, 1] },
+  ];
+
+  // 檔案上傳
+  const handleFileUpload = (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    if (!file.name.endsWith('.json')) {
+      setError('請上傳 JSON 格式的檔案 (通常檔名為 watch-history.json)');
+      return;
+    }
+
+    setIsProcessing(true);
+    setError('');
+    setChannelAvatars({}); 
+    setHasFetchedHolodex(false); // 重置載入狀態
+    setVtuberShake(false);
+    setCopySuccess(false);
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const json = JSON.parse(e.target.result);
+        if (!Array.isArray(json)) throw new Error("檔案格式不符：必須是陣列格式");
+        
+        const isYouTubeHistory = json.some(item => 
+          item.header === "YouTube" || (item.title && item.titleUrl)
+        );
+
+        if (!isYouTubeHistory) throw new Error("找不到 YouTube 紀錄，請確認這是 Google Takeout 的檔案");
+
+        setHistoryData(json);
+      } catch (err) {
+        setError(`解析失敗：${err.message}`);
+      } finally {
+        setIsProcessing(false);
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = null; 
+  };
+
+  // 獲取 Holodex VTuber 資料
+  const fetchHolodexAvatars = async () => {
+    if (!holodexApiKey.trim() || !analysisResults) return;
+    setIsFetchingHolodex(true);
+
+    const channelsToFetch = new Set();
+    const fetchLimit = Math.max(parseInt(filters.topN) * 3, 150);
+    analysisResults.rawChannelsSorted.slice(0, fetchLimit).forEach(c => {
+      if (c.ytChannelId && !channelAvatars[c.name]) {
+        channelsToFetch.add(c);
+      }
+    });
+
+    const updates = { ...channelAvatars };
+    const channelArray = Array.from(channelsToFetch);
+
+    try {
+      for (const channel of channelArray) {
+        try {
+          const res = await fetch(`https://holodex.net/api/v2/channels/${channel.ytChannelId}`, {
+            headers: { 'X-APIKEY': holodexApiKey }
+          });
+          if (res.ok) {
+            const data = await res.json();
+            updates[channel.name] = { photo: data.photo, type: data.type };
+          } else {
+            updates[channel.name] = 'NOT_FOUND';
+          }
+        } catch (e) {
+          updates[channel.name] = 'NOT_FOUND';
+        }
+        await new Promise(r => setTimeout(r, 100));
+      }
+      setChannelAvatars(updates);
+      setHasFetchedHolodex(true); // 標記為成功載入
+    } finally {
+      setIsFetchingHolodex(false);
+    }
+  };
+
+  const getAvatarSrc = (channelName) => {
+    const avatarData = channelAvatars[channelName];
+    if (avatarData && avatarData !== 'NOT_FOUND' && avatarData.photo) {
+      return avatarData.photo;
+    }
+    return `https://ui-avatars.com/api/?name=${encodeURIComponent(channelName)}&background=f4f4f5&color=18181b`;
+  };
+
+  // 取得目前選取的時期文字
+  const getCurrentPeriodText = useCallback(() => {
+    if (filters.targetYear === 'all') return '歷史總計';
+    let text = `${filters.targetYear} 年度`;
+    if (filters.targetSeason !== 'all') {
+      const seasonBox = seasons.find(s => s.value === filters.targetSeason);
+      if (seasonBox) {
+        text += ` ${seasonBox.display}`;
+      }
+    }
+    return text;
+  }, [filters.targetYear, filters.targetSeason]);
+
+  // 複製分享文字功能
+  const handleShare = () => {
+    if (!analysisResults) return;
+    
+    const periodText = getCurrentPeriodText();
+    const isYTM = analysisResults.isYTMMode;
+    const mediaName = isYTM ? '歌曲' : '影片';
+    const channelName = isYTM ? '歌手' : '頻道';
+    
+    const topChannelsText = analysisResults.topChannels
+      .slice(0, 3)
+      .map((c, i) => `   ${i+1}. ${c.name}`)
+      .join('\n');
+
+    const topVideosText = analysisResults.topVideos
+      .slice(0, 3)
+      .map((v, i) => `   ${i+1}. ${v.title}`)
+      .join('\n');
+
+    const shareText = `📊 我的 ${isYTM ? 'YouTube Music' : 'YouTube'} ${periodText}回顧\n` +
+      `---------------------------\n` +
+      `👁️ 總共${isYTM ? '聆聽' : '觀看'}：${analysisResults.totalAnalyzed.toLocaleString()} 首\n` +
+      `🎶 探索${channelName}：${analysisResults.totalUniqueChannels.toLocaleString()} 個\n\n` +
+      `🏆 最常${isYTM ? '聆聽歌手' : '觀看頻道'} Top 3：\n${topChannelsText || '無'}\n\n` +
+      `🔁 最常重播${mediaName} Top 3：\n${topVideosText || '無'}\n` +
+      `---------------------------\n` +
+      `#${isYTM ? 'YouTubeMusic' : 'YouTube'}回顧`;
+
+    try {
+      navigator.clipboard.writeText(shareText).then(() => {
+        setCopySuccess(true);
+        setTimeout(() => setCopySuccess(false), 3000);
+      }).catch(() => fallbackCopyTextToClipboard(shareText));
+    } catch (err) {
+      fallbackCopyTextToClipboard(shareText);
+    }
+  };
+
+  const fallbackCopyTextToClipboard = (text) => {
+    const textArea = document.createElement("textarea");
+    textArea.value = text;
+    textArea.style.position = "fixed"; 
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 3000);
+    } catch (err) {
+      console.error('Fallback: Oops, unable to copy', err);
+    }
+    document.body.removeChild(textArea);
+  };
+
+  // 下載圖片功能
+  const handleDownloadImage = useCallback(async () => {
+    if (summaryCardRef.current === null) {
+      return;
+    }
+    setIsDownloadingImage(true);
+    
+    try {
+      if (!window.html2canvas) {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+          script.onload = resolve;
+          script.onerror = reject;
+          document.body.appendChild(script);
+        });
+      }
+      
+      const images = Array.from(summaryCardRef.current.querySelectorAll('img'));
+      await Promise.all(images.map(img => {
+        if (img.complete) return Promise.resolve();
+        return new Promise((resolve) => {
+          img.onload = resolve;
+          img.onerror = resolve; 
+        });
+      }));
+      
+      await new Promise(r => setTimeout(r, 300));
+      
+      const canvas = await window.html2canvas(summaryCardRef.current, {
+        backgroundColor: '#f8f9fa',
+        useCORS: true,
+        allowTaint: true,
+        scale: 2,
+        logging: false
+      });
+      
+      const dataUrl = canvas.toDataURL('image/png');
+      const link = document.createElement('a');
+      link.download = `YouTube_Rewind_${getCurrentPeriodText().replace(/ /g, '_')}.png`;
+      link.href = dataUrl;
+      link.click();
+    } catch (err) {
+      console.error('圖片生成失敗:', err);
+      setError('圖片生成失敗，請確認網路連線或稍後再試。');
+    } finally {
+      setIsDownloadingImage(false);
+    }
+  }, [getCurrentPeriodText]);
+
+  const getRankColor = (index) => {
+    if (index === 0) return 'text-yellow-400';
+    if (index === 1) return 'text-gray-300';
+    if (index === 2) return 'text-amber-600';
+    return 'text-gray-400';
+  };
+
+  // 核心分析邏輯
+  const analysisResults = useMemo(() => {
+    if (historyData.length === 0) return null;
+
+    const isYTMMode = filters.mediaMode === 'music';
+
+    // 1. Pass 1: 找出所有的音樂 Video IDs
+    const musicVideoIds = new Set();
+    const musicKeywords = /MV|Official Video|Music Video|Official Audio|Lyrics|Cover|歌ってみた|オリジナル曲/i;
+    
+    historyData.forEach(item => {
+      if (!item.titleUrl) return;
+      const isYTM = item.header === "YouTube Music" || item.titleUrl.includes('music.youtube.com');
+      let isYTMusic = false;
+      
+      if (!isYTM && item.header === "YouTube") {
+        const isTopic = item.subtitles && item.subtitles.length > 0 && item.subtitles[0].name.endsWith(' - Topic');
+        if (item.title && (musicKeywords.test(item.title) || isTopic)) {
+          isYTMusic = true;
+        }
+      }
+
+      if (isYTM || isYTMusic) {
+        let videoId = '';
+        try {
+          const urlObj = new URL(item.titleUrl);
+          videoId = urlObj.searchParams.get('v');
+          if (!videoId && item.titleUrl.includes('/shorts/')) {
+            videoId = item.titleUrl.split('/shorts/')[1].split('?')[0];
+          }
+        } catch(e) {}
+        if (videoId) musicVideoIds.add(videoId);
+      }
+    });
+
+    // 2. Pass 2: 根據模式篩選並組合資料
+    let filtered = historyData.filter(item => {
+      if (!item.time || !item.titleUrl || !item.title) return false;
+      
+      let videoId = '';
+      try {
+        const urlObj = new URL(item.titleUrl);
+        videoId = urlObj.searchParams.get('v');
+        if (!videoId && item.titleUrl.includes('/shorts/')) {
+          videoId = item.titleUrl.split('/shorts/')[1].split('?')[0];
+        }
+      } catch(e) {}
+
+      const isYTMRecord = item.header === "YouTube Music" || item.titleUrl.includes('music.youtube.com');
+
+      if (isYTMMode) {
+        if (filters.onlyYTMData) {
+          if (!isYTMRecord) return false;
+        } else {
+          if (!isYTMRecord && !(videoId && musicVideoIds.has(videoId))) {
+            return false;
+          }
+        }
+      } else {
+        if (isYTMRecord) return false;
+      }
+      
+      return item.header === "YouTube" || item.header === "YouTube Music" || !item.header;
+    });
+
+    // 3. 日期與季度篩選
+    if (filters.targetYear !== 'all') {
+      const targetYearNum = parseInt(filters.targetYear);
+      
+      filtered = filtered.filter(item => {
+        const itemDate = new Date(item.time);
+        if (isNaN(itemDate.getTime())) return false; 
+
+        const itemYear = itemDate.getFullYear();
+        const itemMonth = itemDate.getMonth(); 
+
+        if (filters.targetSeason === 'all') {
+          return itemYear === targetYearNum;
+        } else {
+          const selectedSeason = seasons.find(s => s.value === filters.targetSeason);
+          if (!selectedSeason) return itemYear === targetYearNum;
+
+          if (filters.targetSeason === 'winter') {
+            return (itemYear === targetYearNum && itemMonth === 11) || 
+                   (itemYear === targetYearNum + 1 && (itemMonth === 0 || itemMonth === 1));
+          } else {
+            return itemYear === targetYearNum && selectedSeason.months.includes(itemMonth);
+          }
+        }
+      });
+    }
+
+    // 4. 統計運算
+    const channelCounts = {};
+    const videoCounts = {};
+
+    filtered.forEach(item => {
+      const url = item.titleUrl;
+      const title = item.title.replace(/^(Watched |已觀看：)/, '');
+      
+      let videoId = '';
+      try {
+        const urlObj = new URL(url);
+        videoId = urlObj.searchParams.get('v');
+        if (!videoId && url.includes('/shorts/')) {
+           videoId = url.split('/shorts/')[1].split('?')[0];
+        }
+      } catch(e) {}
+
+      let channelName = '';
+      let channelUrl = '';
+      let ytChannelId = '';
+      if (item.subtitles && item.subtitles.length > 0) {
+        channelName = item.subtitles[0].name;
+        channelUrl = item.subtitles[0].url;
+        if (channelUrl.includes('/channel/')) {
+          ytChannelId = channelUrl.split('/channel/')[1];
+        }
+      }
+
+      if (channelName) {
+        if (!channelCounts[channelName]) {
+          channelCounts[channelName] = { count: 0, url: channelUrl, name: channelName, ytChannelId: ytChannelId, uniqueVideos: new Set() };
+        }
+        channelCounts[channelName].count++;
+        if (videoId) {
+          channelCounts[channelName].uniqueVideos.add(videoId);
+        }
+      }
+
+      if (videoId) {
+        if (!videoCounts[videoId]) {
+          videoCounts[videoId] = { count: 0, title: title, url: url, id: videoId, channelName: channelName };
+        }
+        videoCounts[videoId].count++;
+      }
+    });
+
+    let channelVals = Object.values(channelCounts);
+    let videoVals = Object.values(videoCounts);
+
+    const rawChannelsSorted = [...channelVals].sort((a, b) => b.count - a.count);
+
+    if (filters.onlyVTuber) {
+      const isVTuber = (name) => {
+        const data = channelAvatars[name];
+        return data && data !== 'NOT_FOUND' && data.type === 'vtuber';
+      };
+      channelVals = channelVals.filter(c => isVTuber(c.name));
+      videoVals = videoVals.filter(v => isVTuber(v.channelName));
+    }
+
+    const topChannels = channelVals
+      .sort((a, b) => b.count - a.count)
+      .slice(0, Math.max(parseInt(filters.topN), 10)); 
+      
+    const topChannelsByUnique = channelVals
+      .sort((a, b) => b.uniqueVideos.size - a.uniqueVideos.size || b.count - a.count)
+      .slice(0, parseInt(filters.topN));
+
+    const topVideos = videoVals
+      .sort((a, b) => b.count - a.count)
+      .slice(0, parseInt(filters.topN));
+
+    return { 
+      topChannels, 
+      topChannelsByUnique, 
+      topVideos, 
+      totalAnalyzed: filtered.length, 
+      totalUniqueVideos: Object.keys(videoCounts).length,
+      totalUniqueChannels: Object.keys(channelCounts).length,
+      rawChannelsSorted,
+      isYTMMode
+    };
+  }, [historyData, filters, channelAvatars]);
+
+  return (
+    <div className="min-h-screen bg-[#111111] text-gray-100 p-4 sm:p-8 font-sans selection:bg-yellow-500/30">
+      
+      {/* 注入震動動畫的全局 CSS */}
+      <style>{`
+        @keyframes shake {
+          0%, 100% { transform: translateX(0); }
+          20%, 60% { transform: translateX(-5px); }
+          40%, 80% { transform: translateX(5px); }
+        }
+        .animate-shake {
+          animation: shake 0.4s cubic-bezier(.36,.07,.19,.97) both;
+        }
+      `}</style>
+
+      <div className="max-w-6xl mx-auto space-y-12">
+        
+        {/* === 控制面板區塊 === */}
+        <div className="bg-[#1a1a1a] rounded-xl p-6 border border-gray-800 shadow-2xl">
+          <div className="flex items-center space-x-3 mb-6 pb-4 border-b border-gray-800">
+            {filters.mediaMode === 'music' ? (
+              <Music className="w-8 h-8 text-purple-500" />
+            ) : (
+              <Youtube className="w-8 h-8 text-yellow-500" />
+            )}
+            <h1 className="text-2xl font-bold tracking-wider text-white">
+              年度觀看紀錄分析報告
+            </h1>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+            <div className="space-y-6">
+              <div className="flex flex-col justify-center items-center border border-dashed border-gray-700 rounded-lg p-6 hover:border-yellow-500 transition-colors bg-[#141414]">
+                <FileJson className="w-8 h-8 text-gray-500 mb-3" />
+                <label className="cursor-pointer bg-yellow-600 hover:bg-yellow-700 active:bg-yellow-800 text-black px-6 py-2 rounded-md font-bold transition-colors text-sm touch-manipulation">
+                  選擇 watch-history.json
+                  <input type="file" accept=".json" className="hidden" onChange={handleFileUpload} disabled={isProcessing} />
+                </label>
+              </div>
+
+              {historyData.length > 0 && (
+                <div className="bg-[#141414] border border-gray-800 rounded-lg p-4 space-y-4">
+                  <div className="flex items-center space-x-2 text-purple-400 font-medium">
+                    <Zap className="w-4 h-4" />
+                    <span className="text-sm">Holodex 聯動：獲取 VTuber 資料</span>
+                  </div>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <div className="relative flex-grow">
+                      <Key className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
+                      <input 
+                        type="password" 
+                        placeholder="Holodex API Key"
+                        value={holodexApiKey}
+                        onChange={(e) => setHolodexApiKey(e.target.value)}
+                        className="w-full bg-[#111] border border-gray-700 rounded-md pl-9 pr-3 py-2 text-sm text-white focus:outline-none focus:border-purple-500"
+                        disabled={isFetchingHolodex}
+                      />
+                    </div>
+                    <button 
+                      onClick={fetchHolodexAvatars}
+                      disabled={isFetchingHolodex || !holodexApiKey.trim()}
+                      className="bg-purple-600 hover:bg-purple-700 disabled:bg-gray-800 disabled:text-gray-600 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors whitespace-nowrap"
+                    >
+                      {isFetchingHolodex ? '獲取中...' : '載入資料'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-4">
+              <div className="flex items-center justify-between border-b border-gray-800 pb-3 mb-4">
+                <div className="flex items-center space-x-2 text-lg font-bold text-gray-200">
+                  <Filter className="w-5 h-5 text-yellow-500" />
+                  <h2>報告篩選條件</h2>
+                </div>
+                
+                <div 
+                  onClick={() => setFilters(prev => ({...prev, mediaMode: prev.mediaMode === 'video' ? 'music' : 'video'}))}
+                  className="flex items-center space-x-2 bg-[#141414] border border-gray-700 rounded-full px-3 py-1.5 shadow-inner cursor-pointer hover:border-gray-500 transition-colors"
+                >
+                  <span className={`text-sm ${filters.mediaMode === 'video' ? 'text-white font-bold' : 'text-gray-500'}`}>影片</span>
+                  <div className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${filters.mediaMode === 'music' ? 'bg-purple-600' : 'bg-red-600'}`}>
+                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${filters.mediaMode === 'music' ? 'translate-x-[22px]' : 'translate-x-1'}`} />
+                  </div>
+                  <span className={`text-sm ${filters.mediaMode === 'music' ? 'text-white font-bold' : 'text-gray-500'}`}>音樂</span>
+                </div>
+              </div>
+              
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs text-gray-400 block tracking-wider">指定年份</label>
+                  <select 
+                    className="w-full bg-[#141414] border border-gray-700 rounded-md px-3 py-2 text-sm text-white focus:outline-none focus:border-yellow-500 appearance-none"
+                    value={filters.targetYear}
+                    onChange={(e) => {
+                      setFilters(prev => ({
+                        ...prev, 
+                        targetYear: e.target.value,
+                        targetSeason: e.target.value === 'all' ? 'all' : prev.targetSeason
+                      }));
+                    }}
+                  >
+                    <option value="all">所有年份總計</option>
+                    {availableYears.map(year => (
+                      <option key={year} value={year}>{year} 年</option>
+                    ))}
+                  </select>
+                </div>
+                
+                <div className="space-y-1.5">
+                  <label className={`text-xs text-gray-400 block tracking-wider ${filters.targetYear === 'all' ? 'opacity-50' : ''}`}>指定季度</label>
+                  <select 
+                    className={`w-full bg-[#141414] border border-gray-700 rounded-md px-3 py-2 text-sm text-white focus:outline-none focus:border-yellow-500 appearance-none ${filters.targetYear === 'all' ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    value={filters.targetSeason}
+                    onChange={(e) => setFilters({...filters, targetSeason: e.target.value})}
+                    disabled={filters.targetYear === 'all'}
+                  >
+                    <option value="all">全年</option>
+                    {seasons.map(season => (
+                      <option key={season.value} value={season.value}>{season.label}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="space-y-1.5 col-span-2">
+                  <label className="text-xs text-gray-400 block tracking-wider">顯示名次</label>
+                  <select 
+                    className="w-full bg-[#141414] border border-gray-700 rounded-md px-3 py-2 text-sm text-white focus:outline-none focus:border-yellow-500 appearance-none"
+                    value={filters.topN}
+                    onChange={(e) => setFilters({...filters, topN: e.target.value})}
+                  >
+                    <option value="10">前 10 名</option>
+                    <option value="20">前 20 名</option>
+                    <option value="50">前 50 名</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="space-y-3 pt-4 border-t border-gray-800 mt-4">
+                {/* 加上動畫狀態追蹤與攔截事件 */}
+                <label 
+                  className={`flex items-start space-x-3 group p-1 -ml-1 ${!hasFetchedHolodex ? 'cursor-not-allowed' : 'cursor-pointer'} ${vtuberShake ? 'animate-shake' : ''}`}
+                >
+                  <input 
+                    type="checkbox" 
+                    className={`form-checkbox h-4 w-4 text-purple-600 rounded-sm border-gray-600 mt-0.5 ${!hasFetchedHolodex ? 'bg-gray-800' : 'bg-[#141414]'}`}
+                    checked={filters.onlyVTuber} 
+                    onClick={(e) => {
+                      if (!hasFetchedHolodex) {
+                        e.preventDefault();
+                        setVtuberShake(true);
+                        setTimeout(() => setVtuberShake(false), 400);
+                      }
+                    }}
+                    onChange={(e) => {
+                      if (hasFetchedHolodex) {
+                        setFilters({...filters, onlyVTuber: e.target.checked});
+                      }
+                    }}
+                  />
+                  <div className="flex flex-col">
+                    <span className={`text-sm transition-colors ${vtuberShake ? 'text-red-400 font-bold' : 'text-gray-300 group-hover:text-white'}`}>
+                      只顯示 VTuber 頻道 <span className="text-gray-500 text-xs">(需存在Holodex名單)</span>
+                    </span>
+                    {!hasFetchedHolodex && (
+                      <span className={`text-[10px] mt-1 transition-colors ${vtuberShake ? 'text-red-400 font-bold' : 'text-orange-400'}`}>
+                        ⚠️ 需先執行左側 Holodex 載入功能，否則無法過濾
+                      </span>
+                    )}
+                  </div>
+                </label>
+
+                {filters.mediaMode === 'music' && (
+                  <label className="flex items-center space-x-3 cursor-pointer group p-1 -ml-1 animate-in fade-in slide-in-from-left-2">
+                    <input type="checkbox" className="form-checkbox h-4 w-4 text-purple-600 rounded-sm border-gray-600 bg-[#141414]" checked={filters.onlyYTMData} onChange={(e) => setFilters({...filters, onlyYTMData: e.target.checked})}/>
+                    <span className="text-sm text-gray-300 group-hover:text-white transition-colors">只顯示 YouTube Music 數據 <span className="text-gray-500 text-xs">(排除在 YouTube 觀看的音樂)</span></span>
+                  </label>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {error && (
+            <div className="mt-6 bg-red-900/20 border border-red-500/30 text-red-400 p-3 rounded-md flex items-center text-sm">
+              <AlertCircle className="w-4 h-4 mr-2 flex-shrink-0" />
+              <p>{error}</p>
+            </div>
+          )}
+        </div>
+
+        {isProcessing && (
+          <div className="text-center py-20">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-yellow-500 mx-auto"></div>
+            <p className="mt-4 text-sm text-gray-500 tracking-widest">正在生成分析報告...</p>
+          </div>
+        )}
+
+        {/* === 報告生成區塊 === */}
+        {analysisResults && !isProcessing && (
+          <div className="space-y-16 animate-in fade-in duration-700 py-8">
+            
+            <div className="text-center space-y-4 max-w-3xl mx-auto border-b border-gray-800 pb-12">
+              <p className="text-xl sm:text-2xl text-gray-300 font-light leading-relaxed">
+                在 <span className="font-bold text-white">{getCurrentPeriodText()}</span> 期間，您總共{analysisResults.isYTMMode ? '聆聽' : '觀看'}了 <span className="text-yellow-500 font-bold text-3xl sm:text-4xl mx-1">{analysisResults.totalAnalyzed.toLocaleString()}</span> {analysisResults.isYTMMode ? '次歌曲' : '次影片'}，
+                <br />足跡遍佈 <span className="text-yellow-500 font-bold text-3xl sm:text-4xl mx-1">{analysisResults.totalUniqueChannels.toLocaleString()}</span> 個不同的{analysisResults.isYTMMode ? '歌手/頻道' : '頻道'}。
+              </p>
+              {!analysisResults.isYTMMode && (
+                <p className="text-sm sm:text-base text-gray-500">
+                  其中包含了 <span className="text-gray-300 font-semibold">{analysisResults.totalUniqueVideos.toLocaleString()}</span> 部不重複的獨立影片紀錄。
+                </p>
+              )}
+              {filters.onlyVTuber && (
+                <div className="inline-block mt-4 bg-purple-900/30 text-purple-300 text-xs px-3 py-1 rounded-full border border-purple-500/30">
+                  純 VTuber 模式啟動中
+                </div>
+              )}
+            </div>
+
+            {/* Section 1: 最常觀看頻道/歌手 */}
+            <div className="space-y-6">
+              <div className="flex items-center space-x-3 border-l-4 border-yellow-500 pl-4">
+                <h2 className="text-xl sm:text-2xl font-bold text-white tracking-wide">{analysisResults.isYTMMode ? '最常聆聽歌手' : '最常觀看頻道'}</h2>
+                <span className="text-xs font-mono text-gray-400 bg-[#1a1a1a] px-2 py-1 rounded">{analysisResults.isYTMMode ? '依播放次數' : '依點擊次數'}</span>
+              </div>
+              
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                {analysisResults.topChannels.slice(0, 3).map((channel, index) => (
+                  <div key={`top3-chan-${index}`} className="bg-white rounded-lg p-6 flex flex-col items-center relative group shadow-2xl border-b-4 border-gray-200 hover:border-yellow-500 text-center transition-transform hover:-translate-y-1">
+                    <div className={`text-5xl font-black mb-4 ${getRankColor(index)} drop-shadow-md`}>#{index + 1}</div>
+                    <img src={getAvatarSrc(channel.name)} alt={channel.name} className="w-24 h-24 sm:w-28 sm:h-28 rounded-full border-4 border-gray-100 shadow-md object-cover mb-4" loading="lazy" />
+                    <a href={channel.url} target="_blank" rel="noreferrer" className="font-bold text-black text-lg sm:text-xl line-clamp-2 hover:text-yellow-600 mb-2 leading-snug">
+                      {channel.name}
+                    </a>
+                    <div className="mt-auto pt-4 border-t border-gray-100 w-full flex items-center justify-between">
+                      <span className="text-sm text-gray-500">{analysisResults.isYTMMode ? '播放次數' : '觀看次數'}</span>
+                      <span className="font-black text-2xl text-black">{channel.count.toLocaleString()}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+                {analysisResults.topChannels.slice(3).map((channel, index) => (
+                  <div key={`rest-chan-${index}`} className="bg-white rounded-md p-4 flex flex-col relative group shadow-md transition-transform hover:-translate-y-1">
+                    <div className="flex items-start space-x-3 mb-3">
+                      <div className="text-xl font-bold text-gray-400 leading-none">#{index + 4}</div>
+                      <img src={getAvatarSrc(channel.name)} alt={channel.name} className="w-10 h-10 rounded-full border border-gray-200 object-cover" loading="lazy" />
+                    </div>
+                    <div className="flex-grow">
+                      <a href={channel.url} target="_blank" rel="noreferrer" className="font-bold text-black text-sm line-clamp-2 hover:text-yellow-600 leading-snug">
+                        {channel.name}
+                      </a>
+                    </div>
+                    <div className="mt-4 pt-3 border-t border-gray-100 flex items-center justify-between">
+                      <span className="font-black text-base text-black">{channel.count.toLocaleString()} <span className="text-[10px] text-gray-500 font-normal">次</span></span>
+                    </div>
+                    <div className="w-full bg-gray-100 h-1 mt-2 rounded-full overflow-hidden">
+                      <div className="bg-yellow-500 h-full" style={{ width: `${(channel.count / analysisResults.topChannels[0]?.count) * 100}%` }}></div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Section 2: 最廣泛探索 (YTM 模式下隱藏) */}
+            {!analysisResults.isYTMMode && (
+              <div className="space-y-6">
+                <div className="flex items-center space-x-3 border-l-4 border-purple-500 pl-4">
+                  <h2 className="text-xl sm:text-2xl font-bold text-white tracking-wide">最廣泛探索頻道</h2>
+                  <span className="text-xs font-mono text-gray-400 bg-[#1a1a1a] px-2 py-1 rounded">依不重複影片數</span>
+                </div>
+                
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  {analysisResults.topChannelsByUnique.slice(0, 3).map((channel, index) => (
+                    <div key={`top3-unique-${index}`} className="bg-white rounded-lg p-6 flex flex-col items-center relative group shadow-2xl border-b-4 border-gray-200 hover:border-purple-500 text-center transition-transform hover:-translate-y-1">
+                      <div className={`text-5xl font-black mb-4 ${getRankColor(index)} drop-shadow-md`}>#{index + 1}</div>
+                      <img src={getAvatarSrc(channel.name)} alt={channel.name} className="w-24 h-24 sm:w-28 sm:h-28 rounded-full border-4 border-gray-100 shadow-md object-cover mb-4" loading="lazy" />
+                      <a href={channel.url} target="_blank" rel="noreferrer" className="font-bold text-black text-lg sm:text-xl line-clamp-2 hover:text-purple-600 mb-2 leading-snug">
+                        {channel.name}
+                      </a>
+                      <div className="mt-auto pt-4 border-t border-gray-100 w-full flex items-center justify-between">
+                        <span className="text-sm text-gray-500">不同影片數</span>
+                        <span className="font-black text-2xl text-black">{channel.uniqueVideos.size.toLocaleString()}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+                  {analysisResults.topChannelsByUnique.slice(3).map((channel, index) => (
+                    <div key={`rest-unique-${index}`} className="bg-white rounded-md p-4 flex flex-col relative group shadow-md transition-transform hover:-translate-y-1">
+                      <div className="flex items-start space-x-3 mb-3">
+                        <div className="text-xl font-bold text-gray-400 leading-none">#{index + 4}</div>
+                        <img src={getAvatarSrc(channel.name)} alt={channel.name} className="w-10 h-10 rounded-full border border-gray-200 object-cover" loading="lazy" />
+                      </div>
+                      <div className="flex-grow">
+                        <a href={channel.url} target="_blank" rel="noreferrer" className="font-bold text-black text-sm line-clamp-2 hover:text-purple-600 leading-snug">
+                          {channel.name}
+                        </a>
+                      </div>
+                      <div className="mt-4 pt-3 border-t border-gray-100 flex items-center justify-between">
+                        <span className="font-black text-base text-black">{channel.uniqueVideos.size.toLocaleString()} <span className="text-[10px] text-gray-500 font-normal">部</span></span>
+                      </div>
+                      <div className="w-full bg-gray-100 h-1 mt-2 rounded-full overflow-hidden">
+                        <div className="bg-purple-500 h-full" style={{ width: `${(channel.uniqueVideos.size / analysisResults.topChannelsByUnique[0]?.uniqueVideos.size) * 100}%` }}></div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Section 3: 最常重播影片/歌曲 */}
+            <div className="space-y-6">
+              <div className="flex items-center space-x-3 border-l-4 border-red-500 pl-4">
+                <h2 className="text-xl sm:text-2xl font-bold text-white tracking-wide">{analysisResults.isYTMMode ? '最常重播歌曲' : '最常重播影片'}</h2>
+                <span className="text-xs font-mono text-gray-400 bg-[#1a1a1a] px-2 py-1 rounded">依點擊次數</span>
+              </div>
+              
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                {analysisResults.topVideos.slice(0, 3).map((video, index) => (
+                  <div key={`top3-vid-${index}`} className="bg-white rounded-lg overflow-hidden flex flex-col relative group shadow-2xl border-b-4 border-gray-200 hover:border-red-500 transition-transform hover:-translate-y-1">
+                    <div className="relative w-full pt-[56.25%] bg-gray-200">
+                      <img 
+                        src={`https://img.youtube.com/vi/${video.id}/mqdefault.jpg`} 
+                        alt="Thumbnail" 
+                        className="absolute inset-0 w-full h-full object-cover" 
+                        loading="lazy" 
+                        onError={(e) => { e.target.src = 'https://via.placeholder.com/320x180?text=No+Thumb' }} 
+                      />
+                      <div className="absolute top-3 left-3 bg-black/80 text-white text-xl font-bold px-3 py-1 rounded-md shadow-lg border border-gray-700/50">
+                        <span className={getRankColor(index)}>#{index + 1}</span>
+                      </div>
+                    </div>
+                    <div className="p-5 flex flex-col flex-grow">
+                      <a href={video.url} target="_blank" rel="noreferrer" className="font-bold text-black text-lg line-clamp-3 hover:text-red-600 mb-4 leading-relaxed">
+                        {video.title}
+                      </a>
+                      <div className="mt-auto pt-4 border-t border-gray-100 flex items-center justify-between">
+                        <span className="text-sm text-gray-500 flex items-center">
+                          <PlayCircle className="w-4 h-4 mr-1.5" /> 重播次數
+                        </span>
+                        <span className="font-black text-2xl text-black">{video.count}</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                {analysisResults.topVideos.slice(3).map((video, index) => (
+                  <div key={`rest-vid-${index}`} className="bg-white rounded-md flex flex-col relative group shadow-md overflow-hidden transition-transform hover:-translate-y-1">
+                    <div className="relative flex items-center bg-gray-100 p-2 border-b border-gray-200">
+                      <div className="text-lg font-bold text-gray-400 mr-3 w-8 text-center">#{index + 4}</div>
+                      <div className="relative w-24 h-[54px] rounded overflow-hidden flex-shrink-0">
+                        <img src={`https://img.youtube.com/vi/${video.id}/default.jpg`} alt="Thumbnail" className="absolute inset-0 w-full h-full object-cover" loading="lazy" onError={(e) => { e.target.src = 'https://via.placeholder.com/120x90?text=No+Thumb' }} />
+                      </div>
+                      <div className="ml-auto font-black text-lg text-black pr-2">{video.count}</div>
+                    </div>
+                    <div className="p-3 flex-grow bg-white">
+                      <a href={video.url} target="_blank" rel="noreferrer" className="font-bold text-black text-xs line-clamp-2 hover:text-red-600 leading-snug">
+                        {video.title}
+                      </a>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Section 4: 總結小圖卡與分享按鈕 */}
+            <div className="pt-16 pb-8 flex flex-col items-center">
+              
+              <div ref={summaryCardRef} className="bg-[#f8f9fa] w-full max-w-md rounded-xl shadow-2xl p-6 sm:p-8 font-sans border border-gray-200">
+                
+                <h3 className="text-3xl font-black text-black tracking-tight mb-1 pb-1">{analysisResults.isYTMMode ? 'YouTube Music Rewind' : 'YouTube Rewind'}</h3>
+                <p className="text-lg font-bold text-yellow-600 mb-3 pb-1">{getCurrentPeriodText()}</p>
+                <div className="w-full h-1.5 bg-[#222] mb-6 rounded-full"></div>
+                
+                <div className="flex flex-col items-center justify-center space-y-2 mb-6">
+                  <div className="flex items-baseline space-x-2">
+                    <span className="text-5xl font-bold text-[#e7ba64] tracking-tight pb-1">{analysisResults.totalAnalyzed.toLocaleString()}</span>
+                    <span className="text-2xl font-bold text-black pb-1">{analysisResults.isYTMMode ? 'songs' : 'videos'}</span>
+                  </div>
+                  <div className="flex items-baseline space-x-2">
+                    <span className="text-5xl font-bold text-[#e7ba64] tracking-tight pb-1">{analysisResults.totalUniqueChannels.toLocaleString()}</span>
+                    <span className="text-2xl font-bold text-black pb-1">{analysisResults.isYTMMode ? 'artists' : 'channels'}</span>
+                  </div>
+                </div>
+
+                <div className="w-full h-1 bg-[#222] mb-6 rounded-full"></div>
+
+                <h4 className="text-xl font-bold text-black mb-3 pb-1">{analysisResults.isYTMMode ? '最常聆聽歌手 Top 10' : '最常觀看頻道 Top 10'}</h4>
+                
+                <div className="grid grid-cols-2 gap-x-4 gap-y-2 mb-5">
+                  {analysisResults.topChannels.slice(0, 10).map((c, i) => (
+                    <div key={`share-chan-name-${i}`} className="text-[13px] text-gray-800 font-medium truncate tracking-wide flex items-center leading-normal pb-1">
+                      <span className="w-5 text-gray-500 font-bold text-xs">{i + 1}.</span> {c.name}
+                    </div>
+                  ))}
+                </div>
+
+                {filters.onlyVTuber && (
+                  <div className="grid grid-cols-3 gap-4 mb-6">
+                    {analysisResults.topChannels.slice(0, 3).map((c, i) => (
+                      <div key={`share-chan-avatar-${i}`} className="relative w-full pb-[100%]">
+                        <div className="absolute inset-0 rounded-xl shadow-sm border border-gray-200 overflow-hidden bg-gray-100">
+                          <img 
+                            src={getAvatarSrc(c.name)} 
+                            crossOrigin="anonymous"
+                            className="absolute top-0 left-1/2 h-full w-auto max-w-none -translate-x-1/2"
+                            alt={c.name}
+                          />
+                        </div>
+                        <div className="absolute -top-2 -left-2 bg-black text-yellow-400 text-xs font-black w-6 h-6 rounded-full flex items-center justify-center border-2 border-[#f8f9fa] z-10">#{i + 1}</div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="w-full h-1 bg-[#222] mb-6 rounded-full"></div>
+
+                <h4 className="text-xl font-bold text-black mb-4 pb-1">{analysisResults.isYTMMode ? '最常重播歌曲 Top 3' : '最常重播影片 Top 3'}</h4>
+                
+                <div className="grid grid-cols-3 gap-3 mb-2">
+                  {analysisResults.topVideos.slice(0, 3).map((v, i) => (
+                    <div key={`share-vid-${i}`} className="flex flex-col">
+                      <div className="relative w-full pb-[100%] mb-2">
+                        <div className="absolute inset-0 rounded-xl shadow-sm border border-gray-200 overflow-hidden bg-gray-200">
+                          <img 
+                            src={`https://img.youtube.com/vi/${v.id}/mqdefault.jpg`} 
+                            crossOrigin="anonymous"
+                            className="absolute top-0 left-1/2 h-full w-auto max-w-none -translate-x-1/2" 
+                            alt={v.title}
+                            onError={(e) => { e.target.src = 'https://via.placeholder.com/320x320?text=No+Thumb' }}
+                          />
+                        </div>
+                        <div className="absolute top-1 left-1 bg-black/70 text-white text-[10px] font-bold px-1.5 py-0.5 rounded z-10">#{i + 1}</div>
+                      </div>
+                      <div className="text-[11px] text-gray-800 font-medium line-clamp-3 leading-relaxed pb-1">
+                        {v.title}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+              </div>
+
+              <div className="mt-8 w-full max-w-md flex flex-col gap-3">
+                <button 
+                  onClick={handleDownloadImage}
+                  disabled={isDownloadingImage}
+                  className={`w-full py-4 rounded-xl font-bold flex items-center justify-center transition-all shadow-lg text-white ${isDownloadingImage ? 'bg-gray-600' : 'bg-yellow-600 hover:bg-yellow-700 shadow-yellow-900/30'}`}
+                >
+                  {isDownloadingImage ? (
+                    <><div className="animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div> 處理中...</>
+                  ) : (
+                    <><ImageIcon className="w-5 h-5 mr-2" /> 下載圖卡為圖片</>
+                  )}
+                </button>
+                <button 
+                  onClick={handleShare}
+                  className={`w-full py-4 rounded-xl font-bold flex items-center justify-center transition-all shadow-lg ${copySuccess ? 'bg-green-600 text-white shadow-green-900/50' : 'bg-[#f8f9fa] text-black hover:bg-white border border-gray-200'}`}
+                >
+                  {copySuccess ? (
+                    <><CheckCircle2 className="w-5 h-5 mr-2" /> 成功複製純文字！</>
+                  ) : (
+                    <><Share2 className="w-5 h-5 mr-2" /> 複製文字版總結</>
+                  )}
+                </button>
+              </div>
+              <p className="text-center text-xs text-gray-500 mt-4 tracking-wider">無需截圖，直接點擊上方按鈕即可保存或分享</p>
+            </div>
+
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
