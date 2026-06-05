@@ -43,6 +43,7 @@
 
     function App() {
       const [historyData, setHistoryData] = useState([]);
+      const [fileNames, setFileNames] = useState([]);
       const [isProcessing, setIsProcessing] = useState(false);
       const [isRestoringCache, setIsRestoringCache] = useState(true); // 追蹤快取讀取狀態
       const [error, setError] = useState('');
@@ -73,6 +74,9 @@
           try {
             const cachedHistory = await localforage.getItem('yt_historyData');
             if (cachedHistory) setHistoryData(cachedHistory);
+
+            const cachedFileNames = await localforage.getItem('yt_fileNames');
+            if (cachedFileNames) setFileNames(cachedFileNames);
             
             const cachedAvatars = await localforage.getItem('yt_channelAvatars');
             if (cachedAvatars) {
@@ -99,6 +103,7 @@
         try {
           await localforage.clear();
           setHistoryData([]);
+          setFileNames([]);
           setChannelAvatars({});
           setHolodexApiKey('');
           setHasFetchedHolodex(false);
@@ -131,45 +136,87 @@
 
       // 檔案上傳
       const handleFileUpload = (event) => {
-        const file = event.target.files[0];
-        if (!file) return;
-
-        if (!file.name.endsWith('.json')) {
-          setError('請上傳 JSON 格式的檔案 (通常檔名為 watch-history.json)');
-          return;
-        }
+        const files = Array.from(event.target.files);
+        if (files.length === 0) return;
 
         setIsProcessing(true);
         setError('');
-        setChannelAvatars({}); 
-        setHasFetchedHolodex(false); 
         setVtuberShake(false);
         setCopySuccess(false);
 
-        const reader = new FileReader();
-        reader.onload = async (e) => {
-          try {
-            const json = JSON.parse(e.target.result);
-            if (!Array.isArray(json)) throw new Error("檔案格式不符：必須是陣列格式");
-            
-            const isYouTubeHistory = json.some(item => 
-              item.header === "YouTube" || (item.title && item.titleUrl)
-            );
+        const filePromises = files.map(file => {
+          return new Promise((resolve, reject) => {
+            if (!file.name.endsWith('.json')) {
+              reject(new Error(`檔案 "${file.name}" 不是 JSON 格式 (必須為 .json 結尾)`));
+              return;
+            }
 
-            if (!isYouTubeHistory) throw new Error("找不到 YouTube 紀錄，請確認這是 Google Takeout 的檔案");
+            const reader = new FileReader();
+            reader.onload = (e) => {
+              try {
+                const json = JSON.parse(e.target.result);
+                if (!Array.isArray(json)) {
+                  reject(new Error(`檔案 "${file.name}" 格式不符：最外層必須是陣列格式`));
+                  return;
+                }
+                
+                const isYouTubeHistory = json.some(item => 
+                  item.header === "YouTube" || item.header === "YouTube Music" || (item.title && item.titleUrl)
+                );
 
-            setHistoryData(json);
-            // 上傳成功後將資料寫入快取
-            await localforage.setItem('yt_historyData', json);
+                if (!isYouTubeHistory) {
+                  reject(new Error(`檔案 "${file.name}" 找不到 YouTube 紀錄，請確認這是 Google Takeout 的檔案`));
+                  return;
+                }
 
-          } catch (err) {
-            setError(`解析失敗：${err.message}`);
-          } finally {
+                resolve(json);
+              } catch (err) {
+                reject(new Error(`解析檔案 "${file.name}" 失敗：${err.message}`));
+              }
+            };
+            reader.onerror = () => reject(new Error(`讀取檔案 "${file.name}" 失敗`));
+            reader.readAsText(file);
+          });
+        });
+
+        Promise.all(filePromises)
+          .then(async (results) => {
+            // 合併既有與新上傳的資料
+            let merged = [...historyData];
+            results.forEach(arr => {
+              merged = merged.concat(arr);
+            });
+
+            // 根據 time + (titleUrl 或 title) 去除重複紀錄
+            const seen = new Set();
+            const uniqueMerged = [];
+            merged.forEach(item => {
+              if (!item) return;
+              const key = (item.time || '') + '|' + (item.titleUrl || item.title || '');
+              if (!seen.has(key)) {
+                seen.add(key);
+                uniqueMerged.push(item);
+              }
+            });
+
+            // 更新檔案名稱清單
+            const newNames = files.map(f => f.name);
+            const mergedFileNames = Array.from(new Set([...fileNames, ...newNames]));
+
+            setHistoryData(uniqueMerged);
+            setFileNames(mergedFileNames);
+
+            // 寫入本機快取
+            await localforage.setItem('yt_historyData', uniqueMerged);
+            await localforage.setItem('yt_fileNames', mergedFileNames);
+          })
+          .catch((err) => {
+            setError(err.message);
+          })
+          .finally(() => {
             setIsProcessing(false);
-          }
-        };
-        reader.readAsText(file);
-        event.target.value = null; 
+            event.target.value = null; // 清空 input 讓同檔名可以重複上傳
+          });
       };
 
       // 獲取 Holodex VTuber 資料
@@ -345,6 +392,27 @@
 
         const isYTMMode = filters.mediaMode === 'music';
 
+        // 影片 ID 提取輔助函式 (支援標準影片、Shorts、Live 直播以及 youtu.be 短網址)
+        const getVideoId = (url) => {
+          if (!url) return '';
+          try {
+            if (url.includes('youtu.be/')) {
+              return url.split('youtu.be/')[1].split('?')[0];
+            }
+            const urlObj = new URL(url);
+            let videoId = urlObj.searchParams.get('v');
+            if (!videoId && url.includes('/shorts/')) {
+              videoId = url.split('/shorts/')[1].split('?')[0];
+            }
+            if (!videoId && url.includes('/live/')) {
+              videoId = url.split('/live/')[1].split('?')[0];
+            }
+            return videoId || '';
+          } catch (e) {
+            return '';
+          }
+        };
+
         // 1. Pass 1: 找出所有的音樂 Video IDs
         const musicVideoIds = new Set();
         const musicKeywords = /MV|Official Video|Music Video|Official Audio|Lyrics|Cover|歌ってみた|オリジナル曲/i;
@@ -362,14 +430,7 @@
           }
 
           if (isYTM || isYTMusic) {
-            let videoId = '';
-            try {
-              const urlObj = new URL(item.titleUrl);
-              videoId = urlObj.searchParams.get('v');
-              if (!videoId && item.titleUrl.includes('/shorts/')) {
-                videoId = item.titleUrl.split('/shorts/')[1].split('?')[0];
-              }
-            } catch(e) {}
+            const videoId = getVideoId(item.titleUrl);
             if (videoId) musicVideoIds.add(videoId);
           }
         });
@@ -378,14 +439,10 @@
         let filtered = historyData.filter(item => {
           if (!item.time || !item.titleUrl || !item.title) return false;
           
-          let videoId = '';
-          try {
-            const urlObj = new URL(item.titleUrl);
-            videoId = urlObj.searchParams.get('v');
-            if (!videoId && item.titleUrl.includes('/shorts/')) {
-              videoId = item.titleUrl.split('/shorts/')[1].split('?')[0];
-            }
-          } catch(e) {}
+          const videoId = getVideoId(item.titleUrl);
+
+          // 排除無影片 ID 的紀錄（如搜尋紀錄、貼文瀏覽等非影片項目）
+          if (!videoId) return false;
 
           const isYTMRecord = item.header === "YouTube Music" || item.titleUrl.includes('music.youtube.com');
 
@@ -393,7 +450,7 @@
             if (filters.onlyYTMData) {
               if (!isYTMRecord) return false;
             } else {
-              if (!isYTMRecord && !(videoId && musicVideoIds.has(videoId))) {
+              if (!isYTMRecord && !musicVideoIds.has(videoId)) {
                 return false;
               }
             }
@@ -437,16 +494,10 @@
 
         filtered.forEach(item => {
           const url = item.titleUrl;
-          const title = item.title.replace(/^(Watched |已觀看：)/, '');
+          const title = item.title.replace(/^(Watched |已觀看：|已觀看)/, '');
           
-          let videoId = '';
-          try {
-            const urlObj = new URL(url);
-            videoId = urlObj.searchParams.get('v');
-            if (!videoId && url.includes('/shorts/')) {
-               videoId = url.split('/shorts/')[1].split('?')[0];
-            }
-          } catch(e) {}
+          const videoId = getVideoId(url);
+          if (!videoId) return;
 
           let channelName = '';
           let channelUrl = '';
@@ -464,9 +515,7 @@
               channelCounts[channelName] = { count: 0, url: channelUrl, name: channelName, ytChannelId: ytChannelId, uniqueVideos: new Set() };
             }
             channelCounts[channelName].count++;
-            if (videoId) {
-              channelCounts[channelName].uniqueVideos.add(videoId);
-            }
+            channelCounts[channelName].uniqueVideos.add(videoId);
           }
 
           if (videoId) {
@@ -541,22 +590,44 @@
                     <p className="text-gray-400 text-sm">正在讀取本機快取...</p>
                   </div>
                 ) : historyData.length === 0 ? (
-                  <div className="flex flex-col justify-center items-center border border-dashed border-gray-700 rounded-lg p-6 h-32 hover:border-yellow-500 transition-colors bg-[#141414]">
-                    <i className="fa-solid fa-file-code text-3xl text-gray-500 mb-3"></i>
+                  <div className="flex flex-col justify-center items-center border border-dashed border-gray-700 rounded-lg p-6 h-36 hover:border-yellow-500 transition-colors bg-[#141414]">
+                    <i className="fa-solid fa-file-code text-3xl text-gray-500 mb-2"></i>
+                    <p className="text-xs text-gray-400 mb-3">支援同時選取多個 JSON 檔案，或分次上傳合併</p>
                     <label className="cursor-pointer bg-yellow-600 hover:bg-yellow-700 active:bg-yellow-800 text-black px-6 py-2 rounded-md font-bold transition-colors text-sm touch-manipulation">
-                      選擇 watch-history.json
-                      <input type="file" accept=".json" className="hidden" onChange={handleFileUpload} disabled={isProcessing} />
+                      選擇 JSON 檔案
+                      <input type="file" accept=".json" multiple className="hidden" onChange={handleFileUpload} disabled={isProcessing} />
                     </label>
                   </div>
                 ) : (
-                  <div className="flex flex-col justify-center items-center border border-green-800/50 rounded-lg p-6 h-32 bg-[#141414]/80">
-                    <div className="flex items-center text-green-400 mb-2">
-                      <i className="fa-solid fa-database text-2xl mr-2"></i>
-                      <span className="font-bold text-lg">已載入 {historyData.length.toLocaleString()} 筆紀錄</span>
+                  <div className="border border-green-800/30 rounded-lg p-5 bg-[#141414]/80 space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center text-green-400">
+                        <i className="fa-solid fa-database text-xl mr-2"></i>
+                        <span className="font-bold text-base">已載入 {historyData.length.toLocaleString()} 筆不重複紀錄</span>
+                      </div>
+                      <button onClick={handleClearCache} className="text-xs text-gray-500 hover:text-red-400 underline transition-colors">
+                        清除全部快取
+                      </button>
                     </div>
-                    <button onClick={handleClearCache} className="text-sm text-gray-500 hover:text-red-400 underline mt-2 transition-colors">
-                      清除快取並重新上傳
-                    </button>
+                    {fileNames.length > 0 && (
+                      <div className="bg-[#111] p-3 rounded border border-gray-800/80">
+                        <p className="text-xs text-gray-500 mb-1.5 font-bold tracking-wider">已解析檔案列表：</p>
+                        <ul className="text-xs text-gray-300 space-y-1 max-h-20 overflow-y-auto pr-1">
+                          {fileNames.map((name, i) => (
+                            <li key={i} className="flex items-center text-gray-400 truncate">
+                              <i className="fa-solid fa-file-lines mr-1.5 text-yellow-600/70"></i>
+                              <span className="truncate" title={name}>{name}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    <div className="flex justify-end">
+                      <label className="cursor-pointer bg-gray-800 hover:bg-gray-700 text-yellow-500 border border-yellow-500/30 px-4 py-2 rounded-md font-bold transition-colors text-xs touch-manipulation flex items-center">
+                        <i className="fa-solid fa-plus mr-1.5"></i> 繼續上傳並合併檔案
+                        <input type="file" accept=".json" multiple className="hidden" onChange={handleFileUpload} disabled={isProcessing} />
+                      </label>
+                    </div>
                   </div>
                 )}
 
