@@ -98,16 +98,14 @@
 
       // 清除快取功能
       const handleClearCache = async () => {
-        if (!window.confirm('確定要清除本機的觀看紀錄與頭像快取嗎？\n這將需要您重新上傳檔案。')) return;
+        if (!window.confirm('確定要清除本機的觀看紀錄與檔案快取嗎？\n這將需要您重新上傳檔案。')) return;
         setIsProcessing(true);
         try {
-          await localforage.clear();
+          // 只刪除歷史紀錄與檔案清單，保留 API Key 與頭像快取
+          await localforage.removeItem('yt_historyData');
+          await localforage.removeItem('yt_fileNames');
           setHistoryData([]);
           setFileNames([]);
-          setChannelAvatars({});
-          setHolodexApiKey('');
-          setHasFetchedHolodex(false);
-          setFilters(prev => ({ ...prev, onlyVTuber: false }));
         } catch (e) {
           console.error('清除快取失敗:', e);
         } finally {
@@ -423,7 +421,7 @@
           let isYTMusic = false;
           
           if (!isYTM && item.header === "YouTube") {
-            const isTopic = item.subtitles && item.subtitles.length > 0 && item.subtitles[0].name.endsWith(' - Topic');
+            const isTopic = item.subtitles && item.subtitles.length > 0 && item.subtitles[0].name && item.subtitles[0].name.endsWith(' - Topic');
             if (item.title && (musicKeywords.test(item.title) || isTopic)) {
               isYTMusic = true;
             }
@@ -503,9 +501,9 @@
           let channelUrl = '';
           let ytChannelId = '';
           if (item.subtitles && item.subtitles.length > 0) {
-            channelName = item.subtitles[0].name;
-            channelUrl = item.subtitles[0].url;
-            if (channelUrl.includes('/channel/')) {
+            channelName = item.subtitles[0].name || '';
+            channelUrl = item.subtitles[0].url || '';
+            if (channelUrl && channelUrl.includes('/channel/')) {
               ytChannelId = channelUrl.split('/channel/')[1];
             }
           }
